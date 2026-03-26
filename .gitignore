@@ -74,3 +74,6 @@ backend/pytest.ini
 docs/superpowers/
 CLAUDE.md
 langgraph_pentest.py
+deepagent_pentest.py
+deepagent_pentest_v2.py
+deepagent_pentest*.py

@@ -21,6 +21,13 @@ DEFAULT_GUARDRAILS = {
     "disable_account": "require_approval",
     "network_segment": "never_auto",
     "custom": "require_approval",
+    # Counter-attack actions (active defense)
+    "counter_attack": "require_approval",
+    "recon_attacker": "require_approval",
+    "intel_lookup": "auto_approve",
+    "deception": "require_approval",
+    "report_abuse": "require_approval",
+    "tarpit": "require_approval",
 }
 
 # Valid approval levels

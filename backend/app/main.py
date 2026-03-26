@@ -16,6 +16,7 @@ from app.core.ws_push import ws_push_manager
 from app.core.openrouter import openrouter_client
 from app.services.notifier import notifier
 from app.services.correlation_engine import correlation_engine
+from app.services.counter_attack import counter_attack_engine
 from app.services.threat_feeds import threat_feed_manager
 from app.services.report_scheduler import report_scheduler
 from app.services.playbook_engine import playbook_engine
@@ -216,6 +217,12 @@ async def lifespan(app: FastAPI):
     event_bus.subscribe("action_auto_approved", handle_auto_approved_action)
     event_bus.subscribe("action_auto_approved", ws_event_handler)
     logger.info("Event bus started with WebSocket forwarding + auto-execution wired")
+
+    # Start counter-attack engine (active defense)
+    counter_attack_engine.register_event_bus()
+    event_bus.subscribe("counter_attack_analysis", ws_event_handler)
+    event_bus.subscribe("counter_attack_executed", ws_event_handler)
+    logger.info("Counter-attack engine registered (active defense)")
 
     # Start playbook engine
     playbook_engine.register_event_bus(event_bus)

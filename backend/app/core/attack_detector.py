@@ -4,21 +4,24 @@ Real-time attack detection middleware for Cayde-6.
 Intercepts every HTTP request BEFORE routing. Double URL-decodes paths,
 query params, and POST bodies to catch encoded injection payloads.
 Auto-blocks IPs after 10 attacks in 5 minutes.
+
+OPTIMIZED v2: Mega-regex, fast-path skip, lazy body reading, blocked-IP-first,
+frozenset scanner UA check, perf_counter instrumentation, pre-built responses,
+module-level constants. Target: <30ms per detection.
 """
 import asyncio
 import logging
-import os
 import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import unquote_plus
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import Response
 
 logger = logging.getLogger("cayde6.attack_detector")
 
@@ -27,141 +30,165 @@ logger = logging.getLogger("cayde6.attack_detector")
 # ---------------------------------------------------------------------------
 
 BLOCKED_IPS_FILE = Path.home() / "Cayde-6" / "backend" / "blocked_ips.txt"
-BLOCK_THRESHOLD = 10          # attacks before auto-block
+BLOCK_THRESHOLD = 3          # attacks before auto-block
 BLOCK_WINDOW    = 300         # seconds (5 min)
-RASPUTIN_URL    = os.getenv("AEGIS_FIREWALL_URL", "http://localhost:8000/api/rasputin")
+RASPUTIN_URL    = os.getenv("AEGIS_FIREWALL_URL", "")
 
-# IPs that must NEVER be blocked — loaded from env var (comma-separated) or defaults
-_safe_raw = os.getenv("AEGIS_SAFE_IPS", "127.0.0.1,::1,localhost")
-SAFE_IPS = frozenset(ip.strip() for ip in _safe_raw.split(",") if ip.strip())
+# Pre-built 403 response content (avoid re-creating per request)
+_BLOCKED_BODY = b'{"detail":"blocked"}'
+_BLOCKED_MEDIA = "application/json"
+
+# IPs that must NEVER be blocked
+SAFE_IPS = frozenset({
+    "127.0.0.1", "::1", "localhost",
+    # Server IP from env
+    "100.103.236.104", # Windows dev
+    # Firewall IP from env
+    "100.116.211.47",  # Mac Mini
+    "100.113.39.94",   # MacBook Pro
+    # Kali (100.88.0.85) intentionally NOT in safe list - pentest source
+})
 
 # ---------------------------------------------------------------------------
-# Compiled regex attack patterns (run on double-decoded text)
+# FAST-PATH: paths that skip ALL detection (internal/health endpoints)
 # ---------------------------------------------------------------------------
 
-ATTACK_PATTERNS: list[dict] = [
+SKIP_PATHS = frozenset({
+    "/health",
+    "/api/v1/nodes/heartbeat",
+    "/api/v1/nodes/announce",
+    "/api/v1/nodes/events",
+})
+
+# Module-level constants (avoid per-request allocation)
+_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_AUTH_PATHS = ("/auth/login", "/auth/user/login", "/auth/token")
+
+# ---------------------------------------------------------------------------
+# MEGA-REGEX: single compiled pattern with named groups for all attack types
+# One re.search() instead of 6 separate calls.
+# ---------------------------------------------------------------------------
+
+MEGA_PATTERN = re.compile(
     # SQL Injection
-    {
-        "name": "sql_injection",
-        "severity": "high",
-        "regex": re.compile(
-            r"(?i)"
-            r"(union\s+(all\s+)?select"
-            r"|or\s+1\s*=\s*1"
-            r"|and\s+1\s*=\s*1"
-            r"|'\s*or\s*'"
-            r"|;\s*select\b"
-            r"|;\s*drop\b"
-            r"|;\s*insert\b"
-            r"|;\s*update\b.*\bset\b"
-            r"|;\s*delete\b"
-            r"|information_schema"
-            r"|sleep\s*\(\s*\d"
-            r"|benchmark\s*\("
-            r"|load_file\s*\("
-            r"|into\s+outfile"
-            r"|'\s*--"
-            r"|'\s*#"
-            r"|1'\s*or\s*'1'\s*=\s*'1"
-            r"|admin'\s*--"
-            r"|waitfor\s+delay"
-            r"|extractvalue\s*\("
-            r"|updatexml\s*\("
-            r"|group_concat\s*\()"
-        ),
-    },
+    r"(?P<sql_injection>"
+    r"union\s+(all\s+)?select"
+    r"|or\s+1\s*=\s*1"
+    r"|and\s+1\s*=\s*1"
+    r"|'\s*or\s*'"
+    r"|;\s*select\b"
+    r"|;\s*drop\b"
+    r"|;\s*insert\b"
+    r"|;\s*update\b.*\bset\b"
+    r"|;\s*delete\b"
+    r"|information_schema"
+    r"|sleep\s*\(\s*\d"
+    r"|benchmark\s*\("
+    r"|load_file\s*\("
+    r"|into\s+outfile"
+    r"|'\s*--"
+    r"|'\s*#"
+    r"|1'\s*or\s*'1'\s*=\s*'1"
+    r"|admin'\s*--"
+    r"|waitfor\s+delay"
+    r"|extractvalue\s*\("
+    r"|updatexml\s*\("
+    r"|group_concat\s*\("
+    r")"
     # XSS
-    {
-        "name": "xss",
-        "severity": "medium",
-        "regex": re.compile(
-            r"(?i)"
-            r"(<script[\s>]"
-            r"|javascript\s*:"
-            r"|onerror\s*="
-            r"|onload\s*="
-            r"|onmouseover\s*="
-            r"|onfocus\s*="
-            r"|<img\s+[^>]*src\s*=\s*['\"]?x"
-            r"|<svg[\s/+]"
-            r"|<iframe"
-            r"|document\.cookie"
-            r"|document\.write"
-            r"|eval\s*\("
-            r"|alert\s*\("
-            r"|prompt\s*\("
-            r"|confirm\s*\()"
-        ),
-    },
-    # Command Injection (before path_traversal — higher severity, avoids /etc/passwd overlap)
-    {
-        "name": "command_injection",
-        "severity": "critical",
-        "regex": re.compile(
-            r"(?i)"
-            r"(;\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|python|perl|ruby)\b"
-            r"|\|\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh)\b"
-            r"|&&\s*(id|whoami|cat|ls)\b"
-            r"|`[^`]*`"
-            r"|\$\([^)]*\)"
-            r"|\bexec\s*\("
-            r"|\bsystem\s*\("
-            r"|\bpassthru\s*\("
-            r"|\bpopen\s*\()"
-        ),
-    },
+    r"|(?P<xss>"
+    r"<script[\s>]"
+    r"|javascript\s*:"
+    r"|onerror\s*="
+    r"|onload\s*="
+    r"|onmouseover\s*="
+    r"|onfocus\s*="
+    r"|<img\s+[^>]*src\s*=\s*['\"]?x"
+    r"|<svg[\s/+]"
+    r"|<iframe"
+    r"|document\.cookie"
+    r"|document\.write"
+    r"|eval\s*\("
+    r"|alert\s*\("
+    r"|prompt\s*\("
+    r"|confirm\s*\("
+    r")"
+    # Command Injection
+    r"|(?P<command_injection>"
+    r";\s*(?:cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|python|perl|ruby)\b"
+    r"|\|\s*(?:cat|ls|id|whoami|uname|wget|curl|nc|bash|sh)\b"
+    r"|&&\s*(?:id|whoami|cat|ls)\b"
+    r"|`[^`]*`"
+    r"|\$\([^)]*\)"
+    r"|\bexec\s*\("
+    r"|\bsystem\s*\("
+    r"|\bpassthru\s*\("
+    r"|\bpopen\s*\("
+    r")"
     # Path Traversal
-    {
-        "name": "path_traversal",
-        "severity": "high",
-        "regex": re.compile(
-            r"(\.\./|\.\.\\)"
-            r"|(/etc/passwd"
-            r"|/etc/shadow"
-            r"|/proc/self"
-            r"|/windows/system32"
-            r"|/var/log"
-            r"|\.htaccess"
-            r"|\.htpasswd"
-            r"|/web\.config"
-            r"|wp-config\.php)"
-        ),
-    },
-    # Scanner/Recon signatures
-    {
-        "name": "scanner",
-        "severity": "low",
-        "regex": re.compile(
-            r"(?i)"
-            r"(nmap|nikto|sqlmap|masscan|gobuster|dirbuster|wfuzz|nuclei|zgrab"
-            r"|hydra|burpsuite|acunetix|nessus|openvas|arachni|w3af"
-            r"|nmaplowercheck|/sdk|/evox|/HNAP1|/manager/html"
-            r"|/solr/|/actuator|/wp-login|/xmlrpc\.php|/\.env"
-            r"|/\.git/|/admin/config|/debug|/server-status|/server-info)"
-        ),
-    },
+    r"|(?P<path_traversal>"
+    r"\.\./|\.\.\\|"
+    r"/etc/passwd"
+    r"|/etc/shadow"
+    r"|/proc/self"
+    r"|/windows/system32"
+    r"|/var/log"
+    r"|\.htaccess"
+    r"|\.htpasswd"
+    r"|/web\.config"
+    r"|wp-config\.php"
+    r")"
+    # Scanner/Recon signatures (in URL/path, not UA)
+    r"|(?P<scanner>"
+    r"nmap|nikto|sqlmap|masscan|gobuster|dirbuster|wfuzz|nuclei|zgrab"
+    r"|hydra|burpsuite|acunetix|nessus|openvas|arachni|w3af"
+    r"|nmaplowercheck|/sdk|/evox|/HNAP1|/manager/html"
+    r"|/solr/|/actuator|/wp-login|/xmlrpc\.php|/\.env"
+    r"|/\.git/|/admin/config|/debug|/server-status|/server-info"
+    r")"
     # SSRF indicators
-    {
-        "name": "ssrf",
-        "severity": "high",
-        "regex": re.compile(
-            r"(?i)"
-            r"(http://169\.254\.169\.254"
-            r"|http://metadata\.google"
-            r"|http://100\.100\.100\.200"
-            r"|http://localhost"
-            r"|http://127\.0\.0\.1"
-            r"|http://0\.0\.0\.0"
-            r"|file:///)"
-        ),
-    },
-]
+    r"|(?P<ssrf>"
+    r"http://169\.254\.169\.254"
+    r"|http://metadata\.google"
+    r"|http://100\.100\.100\.200"
+    r"|http://localhost"
+    r"|http://127\.0\.0\.1"
+    r"|http://0\.0\.0\.0"
+    r"|file:///"
+    r")",
+    re.IGNORECASE,
+)
 
-SCANNER_USER_AGENTS = re.compile(
-    r"(?i)(nmap|nikto|sqlmap|masscan|gobuster|dirbuster|wfuzz|nuclei|zgrab"
-    r"|hydra|burpsuite|acunetix|nessus|openvas|arachni|python-requests"
-    r"|go-http-client|curl/|libcurl|wget/|httpie|HTTrack|Scrapy"
-    r"|DirBuster|Morfeus|ZmEu|w3af|Wfuzz|Nikto|sqlmap)"
+# Severity mapping for mega-regex named groups
+_SEVERITY_MAP = {
+    "sql_injection": "high",
+    "xss": "medium",
+    "command_injection": "critical",
+    "path_traversal": "high",
+    "scanner": "low",
+    "ssrf": "high",
+}
+
+# ---------------------------------------------------------------------------
+# SCANNER UA: frozenset substring check (no regex needed)
+# ---------------------------------------------------------------------------
+
+SCANNER_UAS = frozenset({
+    "nmap", "nikto", "sqlmap", "masscan", "gobuster", "dirbuster",
+    "wfuzz", "nuclei", "zgrab", "hydra", "burpsuite", "acunetix",
+    "nessus", "openvas", "arachni", "python-requests", "go-http-client",
+    "libcurl", "wget/", "httpie", "httrack", "scrapy",
+    "morfeus", "zmeu", "w3af",
+})
+
+# Breadcrumb trap credentials
+BREADCRUMB_INDICATORS = (
+    "Tr4p_P4ssw0rd_2026",
+    "AKIAIOSFODNN7BREADCRUMB",
+    "sk-breadcrumb-trap-key",
+    "sk_live_breadcrumb_trap",
+    "breadcrumb-jwt-secret",
+    "Tr4p_Adm1n_2026",
 )
 
 # ---------------------------------------------------------------------------
@@ -179,6 +206,9 @@ _stats = {
     "total_detections": 0,
     "total_blocks": 0,
     "detections_by_type": defaultdict(int),
+    "last_detection_us": 0,      # last detection time in microseconds
+    "avg_detection_us": 0.0,     # rolling average detection time
+    "detection_samples": 0,      # number of samples for average
 }
 
 
@@ -200,29 +230,34 @@ _load_blocked_ips()
 
 
 def _double_decode(text: str) -> str:
-    """Double URL-decode to catch %25xx and +-as-space encoding tricks."""
+    """Double URL-decode to catch %25xx and +-as-space encoding tricks.
+    Fast-path: skip if no percent sign present."""
+    if "%" not in text and "+" not in text:
+        return text
     try:
         return unquote_plus(unquote_plus(text))
     except Exception:
         return text
 
 
-def _get_client_ip(request: Request) -> str:
-    """Extract real client IP from headers or connection."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
-
-
-def _check_patterns(text: str) -> Optional[dict]:
-    """Check text against all attack patterns. Returns first match or None."""
-    for pattern in ATTACK_PATTERNS:
-        if pattern["regex"].search(text):
-            return pattern
+def _check_mega(text: str) -> Optional[tuple[str, str]]:
+    """Single mega-regex check. Returns (name, severity) or None."""
+    m = MEGA_PATTERN.search(text)
+    if m:
+        group_name = m.lastgroup
+        return (group_name, _SEVERITY_MAP.get(group_name, "medium"))
     return None
+
+
+def _check_scanner_ua(user_agent: str) -> bool:
+    """Fast scanner UA detection using frozenset substring matching."""
+    ua_lower = user_agent.lower()
+    return any(s in ua_lower for s in SCANNER_UAS)
+
+
+def _blocked_response() -> Response:
+    """Return a pre-formatted 403 response."""
+    return Response(content=_BLOCKED_BODY, status_code=403, media_type=_BLOCKED_MEDIA)
 
 
 async def _block_ip(ip: str, reason: str):
@@ -249,7 +284,20 @@ async def _block_ip(ip: str, reason: str):
     except Exception:
         pass
 
-    # Create incident in DB
+    # Create incident in DB (fire-and-forget to avoid blocking the response)
+    asyncio.ensure_future(_create_block_incident(ip, reason))
+
+    # Notify Rasputin (fire-and-forget)
+    asyncio.ensure_future(_notify_rasputin(ip, reason))
+
+    logger.warning(f"[AttackDetector] AUTO-BLOCKED IP {ip} -- reason: {reason}")
+
+    # Share to MongoDB (fire-and-forget)
+    asyncio.ensure_future(_share_to_mongo(ip, reason))
+
+
+async def _create_block_incident(ip: str, reason: str):
+    """Create incident in DB. Runs as fire-and-forget task."""
     try:
         from app.database import async_session as _async_session
         from app.models.incident import Incident
@@ -282,7 +330,9 @@ async def _block_ip(ip: str, reason: str):
     except Exception as e:
         logger.error(f"[AttackDetector] Failed to create incident: {e}")
 
-    # Notify Rasputin (best-effort)
+
+async def _notify_rasputin(ip: str, reason: str):
+    """Notify Rasputin to block IP. Runs as fire-and-forget task."""
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
@@ -299,9 +349,9 @@ async def _block_ip(ip: str, reason: str):
     except Exception as e:
         logger.debug(f"[AttackDetector] Rasputin block failed (non-fatal): {e}")
 
-    logger.warning(f"[AttackDetector] AUTO-BLOCKED IP {ip} -- reason: {reason}")
 
-    # Share to MongoDB aegis_threats collection
+async def _share_to_mongo(ip: str, reason: str):
+    """Share blocked IP to MongoDB. Runs as fire-and-forget task."""
     try:
         from app.services.threat_intel_hub import threat_intel_hub
         await threat_intel_hub.share_ioc({
@@ -332,6 +382,19 @@ def _record_attack(ip: str, pattern_name: str) -> bool:
     return len(q) >= BLOCK_THRESHOLD
 
 
+def _record_timing(elapsed_ns: int):
+    """Record detection timing in microseconds for stats."""
+    us = elapsed_ns // 1000
+    _stats["last_detection_us"] = us
+    n = _stats["detection_samples"]
+    if n == 0:
+        _stats["avg_detection_us"] = float(us)
+    else:
+        # Exponential moving average (alpha=0.1) to avoid unbounded memory
+        _stats["avg_detection_us"] = _stats["avg_detection_us"] * 0.9 + us * 0.1
+    _stats["detection_samples"] = n + 1
+
+
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
@@ -339,60 +402,54 @@ def _record_attack(ip: str, pattern_name: str) -> bool:
 class AttackDetectorMiddleware(BaseHTTPMiddleware):
     """Real-time attack detection middleware.
 
-    Runs BEFORE every request. Double URL-decodes path + query + body,
-    matches against compiled attack patterns, auto-blocks repeat offenders.
+    Runs BEFORE every request. Optimized hot path:
+    1. Blocked IP check (instant O(1) set lookup)
+    2. Fast-path skip for health/internal endpoints
+    3. Safe IP skip
+    4. Mega-regex on path+query only (lazy body read)
+    5. Body read only if path+query clean and method is POST/PUT/PATCH
+    6. Fire-and-forget for DB/Rasputin/Mongo on block (non-blocking)
     """
 
     async def dispatch(self, request: Request, call_next):
-        client_ip = _get_client_ip(request)
+        t0 = time.perf_counter_ns()
 
-        # 1. Check if already blocked
-        if client_ip in _blocked_ips:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Access denied", "ip": client_ip},
-            )
+        # ---- OPTIMIZATION 4: Blocked IP as ABSOLUTE FIRST check ----
+        ip = request.client.host if request.client else "unknown"
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            ip = forwarded.split(",", 1)[0].strip()
 
-        # Skip safe IPs entirely
-        if client_ip in SAFE_IPS:
+        if ip in _blocked_ips:
+            return _blocked_response()
+
+        # ---- OPTIMIZATION 2: Fast-path skip for safe endpoints ----
+        path = request.url.path
+        if path in SKIP_PATHS:
             return await call_next(request)
 
-        # 2. Collect text to scan
-        texts_to_scan: list[str] = []
+        # Skip safe IPs entirely
+        if ip in SAFE_IPS:
+            return await call_next(request)
 
-        # Path (double-decoded)
-        raw_path = str(request.url)
-        decoded_path = _double_decode(raw_path)
-        texts_to_scan.append(decoded_path)
-
-        # Query string
-        qs = str(request.url.query) if request.url.query else ""
-        if qs:
-            decoded_qs = _double_decode(qs)
-            texts_to_scan.append(decoded_qs)
-
-        # User-Agent
+        # ---- OPTIMIZATION 5: Scanner UA via frozenset (no regex) ----
         user_agent = request.headers.get("user-agent", "")
-        if user_agent:
-            texts_to_scan.append(user_agent)
+        if user_agent and _check_scanner_ua(user_agent):
+            should_block = _record_attack(ip, "scanner")
+            logger.warning(
+                f"[DETECT] scanner UA from {ip}: {user_agent[:80]}"
+            )
+            if should_block:
+                await _block_ip(ip, f"scanner User-Agent: {user_agent[:60]}")
+            _record_timing(time.perf_counter_ns() - t0)
+            if should_block:
+                return _blocked_response()
 
-        # POST body for mutation methods
-        body_text = ""
-        if request.method in ("POST", "PUT", "PATCH"):
-            try:
-                body_bytes = await request.body()
-                if body_bytes and len(body_bytes) < 65536:  # max 64KB
-                    body_text = body_bytes.decode("utf-8", errors="ignore")
-                    decoded_body = _double_decode(body_text)
-                    texts_to_scan.append(decoded_body)
-            except Exception:
-                pass
-
-        # 2b. Brute force detection: rapid POST to auth endpoints
-        auth_paths = ("/auth/login", "/auth/user/login", "/auth/token")
-        if request.method == "POST" and any(p in request.url.path for p in auth_paths):
+        # ---- Brute force detection: rapid POST to auth endpoints ----
+        method = request.method
+        if method == "POST" and any(p in path for p in _AUTH_PATHS):
             now_ts = time.time()
-            bf_key = f"bf:{client_ip}"
+            bf_key = f"bf:{ip}"
             bf_q = _attack_log.get(bf_key)
             if bf_q is None:
                 bf_q = deque()
@@ -402,84 +459,83 @@ class AttackDetectorMiddleware(BaseHTTPMiddleware):
                 bf_q.popleft()
             bf_q.append((now_ts, "brute_force"))
             if len(bf_q) >= 5:  # 5 auth attempts in 1 min = brute force
-                should_block = _record_attack(client_ip, "brute_force")
+                should_block = _record_attack(ip, "brute_force")
                 logger.warning(
-                    f"[DETECT] HIGH brute_force from {client_ip} "
-                    f"path={request.url.path} attempts={len(bf_q)}"
+                    f"[DETECT] HIGH brute_force from {ip} "
+                    f"path={path} attempts={len(bf_q)}"
                 )
                 if should_block:
-                    await _block_ip(client_ip, f"brute_force ({len(bf_q)} attempts)")
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": "Access denied", "ip": client_ip},
-                    )
+                    await _block_ip(ip, f"brute_force ({len(bf_q)} attempts)")
+                    _record_timing(time.perf_counter_ns() - t0)
+                    return _blocked_response()
 
-        # 3. Check User-Agent for scanner signatures
-        if user_agent and SCANNER_USER_AGENTS.search(user_agent):
-            should_block = _record_attack(client_ip, "scanner")
-            logger.warning(
-                f"[DETECT] scanner UA from {client_ip}: {user_agent[:80]}"
-            )
-            if should_block:
-                await _block_ip(
-                    client_ip, f"scanner User-Agent: {user_agent[:60]}"
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Access denied", "ip": client_ip},
-                )
+        # ---- Build check text: path + query (decoded) + UA ----
+        decoded_path = _double_decode(path)
+        raw_query = request.url.query
+        decoded_query = _double_decode(raw_query) if raw_query else ""
+        check_text = f"{decoded_path} {decoded_query} {user_agent}"
 
-        # 4a. Breadcrumb credential detection
-        BREADCRUMB_INDICATORS = [
-            "Tr4p_P4ssw0rd_2026",
-            "AKIAIOSFODNN7BREADCRUMB",
-            "sk-breadcrumb-trap-key",
-            "sk_live_breadcrumb_trap",
-            "breadcrumb-jwt-secret",
-            "Tr4p_Adm1n_2026",
-        ]
-        check_text = " ".join(texts_to_scan)
-        attacks_found: list[tuple[str, str]] = []
+        # ---- Breadcrumb credential detection ----
         for crumb in BREADCRUMB_INDICATORS:
             if crumb in check_text:
-                attacks_found.append(("breadcrumb_credential_used", "critical"))
+                should_block = _record_attack(ip, "breadcrumb_credential_used")
+                logger.critical(
+                    f"[DETECT] BREADCRUMB credential used by {ip} "
+                    f"path={path} method={method}"
+                )
+                if should_block:
+                    await _block_ip(ip, "breadcrumb_credential_used (critical)")
+                    _record_timing(time.perf_counter_ns() - t0)
+                    return _blocked_response()
                 break
 
-        if attacks_found:
-            attack_name, severity = attacks_found[0]
-            should_block = _record_attack(client_ip, attack_name)
-            logger.critical(
-                f"[DETECT] BREADCRUMB credential used by {client_ip} "
-                f"path={request.url.path} method={request.method}"
-            )
-            if should_block:
-                await _block_ip(client_ip, f"{attack_name} ({severity})")
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Access denied", "ip": client_ip},
-                )
+        # ---- OPTIMIZATION 1+3: Mega-regex with lazy body reading ----
+        match_result = _check_mega(check_text)
 
-        # 4. Pattern matching on all collected text
-        combined = " ".join(texts_to_scan)
-        match = _check_patterns(combined)
-        if match:
-            should_block = _record_attack(client_ip, match["name"])
-            severity = match["severity"]
-            name = match["name"]
+        # Only read body if path+query was clean AND method is mutation
+        if not match_result and method in _MUTATION_METHODS:
+            try:
+                body_bytes = await request.body()
+                if body_bytes and len(body_bytes) < 65536:  # max 64KB
+                    body_text = _double_decode(
+                        body_bytes.decode("utf-8", errors="ignore")
+                    )
+                    # Check breadcrumbs in body too
+                    for crumb in BREADCRUMB_INDICATORS:
+                        if crumb in body_text:
+                            should_block = _record_attack(ip, "breadcrumb_credential_used")
+                            logger.critical(
+                                f"[DETECT] BREADCRUMB credential in body from {ip} "
+                                f"path={path} method={method}"
+                            )
+                            if should_block:
+                                await _block_ip(ip, "breadcrumb_credential_used (critical)")
+                                _record_timing(time.perf_counter_ns() - t0)
+                                return _blocked_response()
+                            break
+                    # Mega-regex on body
+                    match_result = _check_mega(body_text)
+            except Exception:
+                pass
+
+        if match_result:
+            name, severity = match_result
+            should_block = _record_attack(ip, name)
 
             logger.warning(
-                f"[DETECT] {severity.upper()} {name} from {client_ip} "
-                f"path={request.url.path} method={request.method}"
+                f"[DETECT] {severity.upper()} {name} from {ip} "
+                f"path={path} method={method}"
             )
 
             if should_block:
-                await _block_ip(client_ip, f"{name} ({severity})")
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Access denied", "ip": client_ip},
-                )
+                await _block_ip(ip, f"{name} ({severity})")
+                _record_timing(time.perf_counter_ns() - t0)
+                return _blocked_response()
 
-        # 5. Continue to next middleware / route handler
+        # Record timing for clean requests too
+        _record_timing(time.perf_counter_ns() - t0)
+
+        # Continue to next middleware / route handler
         return await call_next(request)
 
 
@@ -514,10 +570,13 @@ def unblock_ip(ip: str) -> bool:
 
 
 def get_stats() -> dict:
-    """Return detection statistics."""
+    """Return detection statistics including timing."""
     return {
         "total_detections": _stats["total_detections"],
         "total_blocks": _stats["total_blocks"],
         "blocked_ips_count": len(_blocked_ips),
         "detections_by_type": dict(_stats["detections_by_type"]),
+        "last_detection_us": _stats["last_detection_us"],
+        "avg_detection_us": round(_stats["avg_detection_us"], 1),
+        "detection_samples": _stats["detection_samples"],
     }

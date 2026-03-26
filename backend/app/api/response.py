@@ -12,6 +12,7 @@ from app.models.client import Client
 from app.models.incident import Incident
 from app.models.action import Action
 from app.services.ai_engine import ai_engine
+from app.services.counter_attack import counter_attack_engine, COUNTER_ATTACK_ACTIONS
 from app.modules.response.ingestion import alert_ingestion
 from app.modules.response.responder import active_responder
 
@@ -285,3 +286,137 @@ async def update_guardrails(
     auth.client.guardrails = body.guardrails
     await db.commit()
     return GuardrailConfig(guardrails=auth.client.guardrails)
+
+
+# --- Counter-Attack Endpoints ---
+
+
+class CounterAttackRequest(BaseModel):
+    action_type: str | None = None  # recon_attacker, intel_lookup, deception, report_abuse, tarpit
+
+
+@router.post("/counter-attack/{incident_id}")
+async def trigger_counter_attack(
+    incident_id: str,
+    auth: AuthContext = Depends(require_analyst),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger AI counter-attack analysis for an incident. Analyst or admin only.
+
+    Uses dolphin-mistral uncensored model to analyze the attacker and
+    recommend counter-measures (recon, intel, deception, reporting, tarpit).
+    """
+    client = auth.client
+    result = await db.execute(
+        select(Incident).where(
+            Incident.id == incident_id,
+            Incident.client_id == client.id,
+        )
+    )
+    incident = result.scalar_one_or_none()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    analysis = await counter_attack_engine.analyze(
+        incident_id=incident.id,
+        source_ip=incident.source_ip or "unknown",
+        attack_type=incident.title,
+        details=incident.description or "",
+        severity=incident.severity,
+    )
+
+    return {
+        "incident_id": incident_id,
+        "source_ip": incident.source_ip,
+        "analysis": analysis,
+    }
+
+
+@router.get("/counter-attack/{incident_id}")
+async def get_counter_attack_analysis(
+    incident_id: str,
+    auth: AuthContext = Depends(require_viewer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get cached counter-attack AI analysis for an incident."""
+    analysis = await counter_attack_engine.get_analysis(incident_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="No counter-attack analysis found for this incident")
+    return analysis
+
+
+@router.post("/counter-attack/{incident_id}/execute")
+async def execute_counter_attack(
+    incident_id: str,
+    body: CounterAttackRequest,
+    auth: AuthContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Execute a specific counter-attack action. Admin only.
+
+    Requires guardrail approval. Available actions:
+    - recon_attacker: Scan attacker IP with nmap
+    - intel_lookup: Threat intel feed lookup
+    - deception: Deploy fake data/honeypot redirect
+    - report_abuse: Report to AbuseIPDB
+    - tarpit: Throttle attacker connections
+    """
+    client = auth.client
+
+    # Get incident
+    result = await db.execute(
+        select(Incident).where(
+            Incident.id == incident_id,
+            Incident.client_id == client.id,
+        )
+    )
+    incident = result.scalar_one_or_none()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    action_type = body.action_type
+    if not action_type:
+        raise HTTPException(status_code=400, detail="action_type is required")
+    if action_type not in COUNTER_ATTACK_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action_type. Must be one of: {list(COUNTER_ATTACK_ACTIONS.keys())}",
+        )
+
+    # Check guardrails
+    action = await guardrail_engine.evaluate_action(
+        client=client,
+        action_type=action_type,
+        target=incident.source_ip or "unknown",
+        ai_reasoning=f"Counter-attack {action_type} against attacker {incident.source_ip}",
+        db=db,
+        incident_id=incident_id,
+    )
+
+    if action.status == "approved":
+        # Execute immediately (auto-approved actions like intel_lookup)
+        exec_result = await counter_attack_engine.execute_action(
+            incident_id=incident_id,
+            action_type=action_type,
+            target_ip=incident.source_ip or "unknown",
+            db=db,
+        )
+        return {
+            "action_id": action.id,
+            "status": "executed",
+            "result": exec_result,
+        }
+    else:
+        return {
+            "action_id": action.id,
+            "status": "pending_approval",
+            "message": f"Counter-attack '{action_type}' requires approval before execution.",
+        }
+
+
+@router.get("/counter-attack-stats")
+async def counter_attack_stats(
+    auth: AuthContext = Depends(require_viewer),
+):
+    """Get counter-attack engine statistics."""
+    return counter_attack_engine.stats()
