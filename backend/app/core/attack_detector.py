@@ -11,6 +11,7 @@ module-level constants. Target: <30ms per detection.
 """
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import defaultdict, deque
@@ -38,16 +39,9 @@ RASPUTIN_URL    = os.getenv("AEGIS_FIREWALL_URL", "")
 _BLOCKED_BODY = b'{"detail":"blocked"}'
 _BLOCKED_MEDIA = "application/json"
 
-# IPs that must NEVER be blocked
-SAFE_IPS = frozenset({
-    "127.0.0.1", "::1", "localhost",
-    # Server IP from env
-    "100.103.236.104", # Windows dev
-    # Firewall IP from env
-    "100.116.211.47",  # Mac Mini
-    "100.113.39.94",   # MacBook Pro
-    # Kali (100.88.0.85) intentionally NOT in safe list - pentest source
-})
+# IPs that must NEVER be blocked — configured via AEGIS_SAFE_IPS env var
+_safe_ips_str = os.getenv("AEGIS_SAFE_IPS", "127.0.0.1,::1,localhost")
+SAFE_IPS = frozenset(ip.strip() for ip in _safe_ips_str.split(",") if ip.strip())
 
 # ---------------------------------------------------------------------------
 # FAST-PATH: paths that skip ALL detection (internal/health endpoints)

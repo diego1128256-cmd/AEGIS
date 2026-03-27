@@ -417,3 +417,182 @@ async def remove_node(
     await db.delete(agent)
     await db.commit()
     logger.info(f"Node deleted: {node_id}")
+
+
+# ---------------------------------------------------------------------------
+# Node-facing endpoints (no auth)
+# ---------------------------------------------------------------------------
+
+class AnnounceRequest(BaseModel):
+    enroll_code: str
+    hostname: str
+    os_name: str | None = None
+    os_version: str | None = None
+    local_ip: str | None = None
+    agent_version: str = "0.1.0"
+
+
+@router.post("/announce")
+async def announce_node(body: AnnounceRequest):
+    _cleanup_expired()
+    code = body.enroll_code.strip().upper()
+    os_info = f"{body.os_name or ''} {body.os_version or ''}".strip() or None
+    if code in _pending_enrollments and _pending_enrollments[code].get("enrolled"):
+        info = _pending_enrollments[code]
+        return {
+            "status": "active",
+            "client_id": info.get("client_id"),
+            "client_name": info.get("client_name"),
+            "node_id": info.get("node_id"),
+        }
+    _pending_enrollments[code] = {
+        "agent_id": "",
+        "hostname": body.hostname,
+        "os_info": os_info,
+        "ip_address": body.local_ip,
+        "agent_version": body.agent_version,
+        "created_at": datetime.utcnow(),
+        "enrolled": False,
+        "client_id": None,
+        "client_name": None,
+        "node_id": None,
+    }
+    logger.info(f"Node announced: {code} from {body.hostname} ({body.local_ip})")
+    return {"status": "pending", "code": code}
+
+
+@router.get("/status/{code}")
+async def check_enrollment_status(code: str):
+    _cleanup_expired()
+    code = code.strip().upper()
+    info = _pending_enrollments.get(code)
+    if not info:
+        return {"status": "expired", "message": "Code expired or not found"}
+    if info.get("enrolled"):
+        return {
+            "status": "active",
+            "client_id": info.get("client_id"),
+            "client_name": info.get("client_name"),
+            "node_id": info.get("node_id"),
+        }
+    return {"status": "pending", "message": "Waiting for manager to enter code"}
+
+
+class NodeEventRequest(BaseModel):
+    node_id: str
+    event_type: str
+    severity: str = "medium"
+    details: dict = {}
+    timestamp: str | None = None
+
+
+@router.post("/events")
+async def receive_node_event(
+    body: NodeEventRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(EndpointAgent).where(EndpointAgent.id == body.node_id)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    logger.info(f"Node event from {body.node_id}: {body.event_type} [{body.severity}]")
+
+    if body.severity in ("high", "critical"):
+        from app.models.incident import Incident
+
+        incident = Incident(
+            client_id=agent.client_id,
+            title=f"EDR: {body.event_type}",
+            description=str(body.details),
+            severity=body.severity,
+            status="open",
+            source=f"node:{body.node_id}",
+            source_ip=agent.ip_address,
+        )
+        db.add(incident)
+        await db.commit()
+
+    return {"status": "received", "event_type": body.event_type}
+
+
+class AssetReportRequest(BaseModel):
+    node_id: str
+    hostname: str | None = None
+    os_name: str | None = None
+    os_version: str | None = None
+    local_ip: str | None = None
+    cpu_brand: str | None = None
+    cpu_count: int | None = None
+    ram_total_mb: int | None = None
+    disk_total_gb: float | None = None
+    open_services: list = []
+    scan_timestamp: str | None = None
+
+
+@router.post("/report-assets")
+async def report_assets(
+    body: AssetReportRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    import uuid as _uuid
+    from app.models.asset import Asset
+
+    result = await db.execute(
+        select(EndpointAgent).where(EndpointAgent.id == body.node_id)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    client_id = agent.client_id
+    if body.local_ip:
+        agent.ip_address = body.local_ip
+    if body.os_name:
+        agent.os_info = f"{body.os_name} {body.os_version or ''}".strip()
+
+    ip = body.local_ip or "127.0.0.1"
+    ports_list = [s.get("port") for s in body.open_services if s.get("port")]
+    techs = [
+        f"{s.get('service', 'unknown')}:{s.get('port')}"
+        for s in body.open_services
+        if s.get("service") and s.get("service") != "unknown"
+    ]
+
+    existing = await db.execute(
+        select(Asset).where(Asset.client_id == client_id, Asset.ip_address == ip)
+    )
+    existing_asset = existing.scalar_one_or_none()
+    assets_created = assets_updated = 0
+
+    if existing_asset:
+        existing_asset.hostname = body.hostname or existing_asset.hostname
+        existing_asset.ports = ports_list
+        existing_asset.technologies = techs
+        existing_asset.last_scan_at = datetime.utcnow()
+        assets_updated = 1
+    else:
+        db.add(Asset(
+            id=str(_uuid.uuid4()),
+            client_id=client_id,
+            hostname=body.hostname or "unknown",
+            ip_address=ip,
+            asset_type="server",
+            ports=ports_list,
+            technologies=techs,
+            status="active",
+            risk_score=0.0,
+            last_scan_at=datetime.utcnow(),
+        ))
+        assets_created = 1
+
+    await db.commit()
+    logger.info(f"Asset report from {body.node_id}: {len(body.open_services)} services")
+    return {
+        "status": "ok",
+        "services_found": len(body.open_services),
+        "assets_created": assets_created,
+        "assets_updated": assets_updated,
+    }
